@@ -1,0 +1,402 @@
+<!-- livebook:{"app_settings":{"output_type":"rich","slug":"weblaw"}} -->
+
+# Weblaw Crawler
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.14.2"},
+  {:req, "~> 0.5.7"},
+  {:curl_req, "~> 0.98.5"},
+  {:html2markdown, "~> 0.1.5"},
+  {:flow, "~> 1.2"},
+  {:floki, "~> 0.36.3"},
+  {:explorer, "~> 0.10.0"},
+  {:kino_explorer, "~> 0.1.23"},
+  {:tz, "~> 0.28"}
+])
+```
+
+## Parser and client
+
+First we setup a Parser module for the JSON Response of the weblaw API and a client module to for requesting a list of search results and a single document.
+
+```elixir
+defmodule Parser do
+  @lables_to_translation %{
+    "lex-ch-bund-as" => "Amtliche Sammlung des Bundesrechts",
+    "lex-ch-bund-ab" => "Amtliches Bulletin",
+    "jud-ch-bund-bstger" => "Zitierte weitere Entscheide BStGer",
+    "jud-ch-bund-bgu" => "Zitierte weitere Entscheide BGer",
+    "jud-ch-bund-bge" => "Zitierte BGE",
+    "srCategory" => "Systematische Sammlung",
+    "lex-ch-bund-sr" => "Bundeserlasse",
+    # "publicationDate" => "Publikationsdatum",
+    # "year" => "Eingangsjahr",
+    "jud-ch-bund-bvger" => "Zitierte weitere Entscheide",
+    "jud-ch-bund-bvge" => "Zitierte BVGE",
+    "bvgeStandards" => "BVGE Normen",
+    "bvgeKeywords" => "BVGE Schlagwörter",
+    "filterType" => "BVGE / Weitere Entscheide",
+    # "rulingDate" => "Entscheiddatum",
+    "bvgerDossier" => "Verbundener Entscheid",
+    "bvgeDossier" => "Verbundener BVGE Entscheid",
+    # "panel" => "Abteilung",
+    "ch-jurivoc" => "Erkannte Stichwörter",
+    "lex-ch-bund-bbl" => "Bundesblatt"
+  }
+
+  def transform_overview_result(doc) do
+    new_meta =
+      doc["content"]
+      |> String.split(["<hr>", ";;"])
+      |> List.first()
+      |> String.replace("\r\n", "")
+      |> Html2Markdown.convert()
+      |> String.split("\n", trim: true, parts: 3)
+      |> Enum.map(fn s ->
+        list = String.split(s, ["**", ":", " "], parts: 2, trim: true)
+
+        case list do
+          [k, v] ->
+            {k, v |> String.trim_leading("**") |> String.trim()}
+
+          value ->
+            IO.inspect("error parsing #{doc["leid"]} value #{value}")
+            {"Unknown value", value}
+        end
+      end)
+      |> Map.new()
+
+    Map.merge(
+      %{
+        "leid" => Map.get(doc, "leid"),
+        "Abteilung" => nil,
+        "Prozessgegenstand" => nil,
+        "Sachgebiet" => nil,
+        "Regeste" => nil
+      },
+      new_meta
+    )
+  end
+
+  def html_to_text(%{"content" => content}) do
+    content
+    |> Floki.parse_document!()
+    |> Floki.find("p")
+    |> Enum.reduce([], fn p, acc ->
+      text = Floki.text(p)
+
+      case text do
+        "" -> ["\n" | acc]
+        _ -> [[text, "\n"] | acc]
+      end
+    end)
+    |> Enum.reverse()
+    |> Enum.dedup()
+    |> List.to_string()
+    |> String.trim()
+  end
+
+  def get_title(%{"metadataKeywordTextMap" => %{"title" => title}}) do
+    title
+    |> hd()
+    |> String.split(";;")
+    |> hd
+  end
+
+  def get_ruling_type(%{"metadataKeywordTextMap" => %{"rulingType" => rt}}) do
+    rt
+    |> hd()
+    |> String.split(";;")
+    |> hd()
+  end
+
+  def get_pdf_url(%{"metadataKeywordTextMap" => %{"originalUrl" => url}}) do
+    "https://bvger.weblaw.ch" <> hd(url)
+  end
+
+  def get_publication_data(%{"metadataDateMap" => %{"publicationDate" => date}}) do
+    {:ok, dt, _} = DateTime.from_iso8601(date)
+    DateTime.to_date(dt)
+  end
+
+  def get_ruling_data(%{"metadataDateMap" => %{"rulingDate" => date}}) do
+    {:ok, dt, _} = DateTime.from_iso8601(date)
+    DateTime.to_date(dt)
+  end
+
+  def get_department(%{"metadataKeywordTextMap" => %{"panel" => panel}}) do
+    panel
+    |> hd()
+    |> String.split(";;")
+    |> hd()
+  end
+
+  def get_language(%{"metadataKeywordTextMap" => %{"language" => langs}}) do
+    langs |> Enum.join(";")
+  end
+
+  def extract_nested_metadta(%{"nestedMetadataMap" => data}) do
+    @lables_to_translation
+    |> Enum.map(fn {key, translation} ->
+      {
+        translation,
+        case data[key] do
+          nil ->
+            nil
+
+          value ->
+            value
+            |> Enum.map(fn %{"termMap" => map} -> map["de"] end)
+            |> Enum.join("; ")
+        end
+      }
+    end)
+  end
+end
+
+defmodule Client do
+  def request_list(query) do
+    Req.new(
+      url: "https://bvger.weblaw.ch/api/.netlify/functions/searchQueryService",
+      headers: %{
+        "Content-Type" => "text/plain;charset=UTF-8",
+        "Accept-Encoding" => "gzip, deflate, br",
+        "User-Agent" =>
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1.1 Safari/605.1.15"
+      }
+    )
+    |> Req.request!(body: Jason.encode_to_iodata!(query))
+    |> Map.get(:body)
+    |> Jason.decode!()
+  end
+
+  def request_single(leid) do
+    url =
+      "https://bvger.weblaw.ch/api/.netlify/functions/singleDocQueryService/#{leid}"
+      |> URI.parse()
+      |> URI.append_query(
+        URI.encode_query(%{
+          guiLanguage: :undefined,
+          userID: gen_uid(),
+          sessionDuration: 100
+        })
+      )
+
+    Req.new(
+      url: url,
+      headers: %{
+        accept: "*/*",
+        authorization: "Bearer null",
+        user_agent:
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1.1 Safari/605.1.15",
+        accept_encoding: "gzip, deflate, br"
+      }
+    )
+    |> Req.request!()
+    |> Map.get(:body)
+    |> Jason.decode!()
+  end
+
+  def gen_uid() do
+    :crypto.strong_rand_bytes(4)
+    |> Base.encode32()
+  end
+end
+```
+
+The `Crawler` module combines the `Client` and `Parser` module to make multiple asynchronous requests to the Weblaw API.
+
+Because the Weblaw API limits results to a maximum of 10 pages with a limit of 10 results per page, for a total of 100 entries, the Crawler makes a request for each combination of search term, year, and language to reduce the likelihood of exceeding 100 total results.
+
+```elixir
+defmodule Crawler do
+  @languages ["de", "fr", "it"]
+  @year_range 2006..2024
+
+  def run(queryStrings) do
+    queries =
+      for query <- queryStrings, year <- @year_range, lang <- @languages do
+        %{
+          "query" => query,
+          "metadata" => %{
+            "year" => to_string(year),
+            "language" => lang,
+            "panel" =>
+              "Abt. V (Asylrecht);;Cour V (droit d'asile);;Corte V (diritto di asilo);;Abt. V (Asylrecht) OR Abt. IV (Asylrecht);;Cour IV (droit d'asile);;Corte IV (diritto di asilo);;Abt. IV (Asylrecht)"
+          }
+        }
+      end
+
+    Task.async_stream(queries, &crawl_index/1)
+    |> Enum.reduce([], fn
+      {:ok, v}, acc ->
+        [v | acc]
+
+      _, acc ->
+        acc
+    end)
+    |> List.flatten()
+    |> Task.async_stream(&crawl_single_page/1)
+    |> Enum.to_list()
+    |> Enum.reduce([], fn
+      {:ok, data}, acc ->
+        [data | acc]
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp crawl_index(query) do
+    base_query = %{
+      "aggs" => %{
+        "fields" => [
+          "panel",
+          "language",
+          "rulingType",
+          "subject",
+          "bvgeKeywords",
+          "bvgeStandards",
+          "jud-ch-bund-bvgeList",
+          "jud-ch-bund-bvgerList",
+          "ch-jurivocList",
+          "year",
+          "lex-ch-bund-srList",
+          "srCategoryList",
+          "jud-ch-bund-bgeList",
+          "jud-ch-bund-bguList",
+          "jud-ch-bund-tpfList",
+          "jud-ch-bund-bstgerList",
+          "lex-ch-bund-asList",
+          "lex-ch-bund-bblList",
+          "lex-ch-bund-abList"
+        ],
+        "size" => "10"
+      },
+      "guiLanguage" => "de",
+      "metadataKeywordsMap" => query["metadata"],
+      "queryString" => query["query"],
+      "sessionDuration" => 10,
+      "userID" => Client.gen_uid()
+    }
+
+    first_page = Client.request_list(base_query)
+
+    total = Map.get(first_page, "totalNumberOfDocuments")
+
+    first_page =
+      first_page
+      |> Map.get("documents")
+      |> Enum.map(&Parser.transform_overview_result/1)
+
+    other_pages =
+      for i <- 10..total//10 do
+        query = Map.put(base_query, "from", i)
+
+        Client.request_list(query)
+        |> Map.get("documents")
+        |> Enum.map(&Parser.transform_overview_result/1)
+      end
+
+    [first_page, other_pages]
+  end
+
+  defp crawl_single_page(%{"leid" => leid} = doc) do
+    date = DateTime.now!("Europe/Zurich", Tz.TimeZoneDatabase)
+    single = Client.request_single(leid)
+
+    %{listing: doc, single: single, request_date: date}
+  end
+end
+```
+
+## Search
+
+The following form allows for the search of a single term or a list of terms separated by `;` or `,`. Spaces between words are considered part of a term.
+
+Once the input is submitted, the Crawler module is called to fetch all results and convert them into a DataFrame.
+
+The DataFrame is displayed for inspection and made available as a CSV download.
+
+```elixir
+frame = Kino.Frame.new()
+
+form =
+  Kino.Control.form(
+    [
+      query: Kino.Input.text("Suche")
+    ],
+    submit: "Submit"
+  )
+
+Kino.listen(form, fn event ->
+  Kino.Frame.render(frame, "loading...")
+
+  queryString = Map.get(event.data, :query)
+  |> String.split([";", ","], trim: true)
+  |> Enum.map(fn query ->
+    query
+    |> String.trim()
+    |> String.trim("\"")
+  end)
+
+  {time, results} = :timer.tc(Crawler, :run, [queryString])
+
+  IO.inspect("time to fetch results #{time / 1_000_000}s")
+
+  data =
+    results
+    |> Enum.map(fn %{listing: doc, single: single, request_date: date} ->
+      [
+        InterneDocId: doc["leid"],
+        Title: Parser.get_title(single),
+        SortTitle: hd(single["metadataKeywordTextMap"]["sortTitle"]),
+        Abteilung: doc["Abteilung"],
+        Prozessgegenstand: doc["Prozessgegenstand"],
+        Regeste: doc["Regeste"],
+        Sachgebiet: doc["Sachgebiet"],
+        Eingangsjahr: hd(single["metadataKeywordTextMap"]["year"]),
+        Publikationsdatum: Parser.get_publication_data(single),
+        Entscheiddatum: Parser.get_ruling_data(single),
+        AbrufDatum: date,
+        Sprache: Parser.get_language(single),
+        Ruling_Type: Parser.get_ruling_type(single),
+        Text_Content: Parser.html_to_text(single),
+        HTML_Content: single["content"],
+        PDF_URL: Parser.get_pdf_url(single)
+      ] ++ Parser.extract_nested_metadta(single)
+    end)
+    |> Enum.uniq_by(fn list -> hd(list) end)
+    |> Enum.reverse()
+
+  df = Explorer.DataFrame.new(data)
+
+  date =
+    DateTime.now!("Europe/Zurich", Tz.TimeZoneDatabase)
+    |> DateTime.to_date()
+
+  Kino.Frame.clear(frame)
+
+  Kino.Frame.render(
+    frame,
+    Kino.Layout.tabs(
+      raw_data: df,
+      download:
+        Kino.Download.new(
+          fn ->
+            Explorer.DataFrame.dump_csv!(df)
+          end,
+          filename: "weblaw-dowanload-#{date}.csv"
+        )
+    )
+  )
+end)
+
+Kino.Layout.grid([
+  form,
+  frame
+])
+```
+
+<!-- livebook:{"offset":10738,"stamp":{"token":"XCP.VhtToDzkDNrDs1983F3KU4czuiMaAEAqeLeqXKTrULbcY0eRNoD5nZyqw-jrVh5qpejIPu69OTbSODxg_y8pxcgXDtdt-Yd5SFVqs-R8vLyWOoyyaZq4tY1R","version":2}} -->
