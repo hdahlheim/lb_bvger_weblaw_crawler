@@ -387,7 +387,7 @@ Kino.listen(form, fn event ->
           fn ->
             Explorer.DataFrame.dump_csv!(df)
           end,
-          filename: "weblaw-dowanload-#{date}.csv"
+          filename: "weblaw-download-#{date}.csv"
         )
     )
   )
@@ -399,4 +399,4 @@ Kino.Layout.grid([
 ])
 ```
 
-<!-- livebook:{"offset":10738,"stamp":{"token":"XCP.VhtToDzkDNrDs1983F3KU4czuiMaAEAqeLeqXKTrULbcY0eRNoD5nZyqw-jrVh5qpejIPu69OTbSODxg_y8pxcgXDtdt-Yd5SFVqs-R8vLyWOoyyaZq4tY1R","version":2}} -->
+<!-- livebook:{"offset":10737,"stamp":{"token":"XCP.QCKWnm1cYh_CmmW5wVDTDd2g44KMojqXvCh1QLbV4KjnwkK_D41d_6VsFychDQ9xoHWmtX7sjeAjtrdWX1hNCWdcUR9M0cvhCSUtdTuUv7rW7GNFXLyCWAoN","version":2}} -->
