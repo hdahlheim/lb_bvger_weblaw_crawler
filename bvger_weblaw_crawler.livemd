@@ -212,21 +212,34 @@ Because the Weblaw API limits results to a maximum of 10 pages with a limit of 1
 ```elixir
 defmodule Crawler do
   @languages ["de", "fr", "it"]
-  @year_range 2006..2024
+  # @year_range 2006..2024
+  @dates Enum.chunk_every(Date.range(~D[2006-01-01], Date.utc_today()), 2, 1)
+  @panels [
+    "Abt. V (Asylrecht);;Cour V (droit d'asile);;Corte V (diritto di asilo);;Abt. V (Asylrecht)",
+    "Abt. IV (Asylrecht);;Cour IV (droit d'asile);;Corte IV (diritto di asilo);;Abt. IV (Asylrecht)"
+  ]
 
-  def run(queryStrings) do
+  def run(_queryStrings) do
     queries =
-      for query <- queryStrings, year <- @year_range, lang <- @languages do
+      for [start_date, end_date] <- @dates, lang <- @languages, panel <- @panels do
         %{
-          "query" => query,
+          # "query" => query,
           "metadata" => %{
-            "year" => to_string(year),
+            # "year" => to_string(year),
             "language" => lang,
-            "panel" =>
-              "Abt. V (Asylrecht);;Cour V (droit d'asile);;Corte V (diritto di asilo);;Abt. V (Asylrecht) OR Abt. IV (Asylrecht);;Cour IV (droit d'asile);;Corte IV (diritto di asilo);;Abt. IV (Asylrecht)"
+            "panel" => panel
+          },
+          "metadataDateMap" => %{
+            "publicationDate" => %{
+              "from" => Date.to_iso8601(start_date),
+              "to" => Date.to_iso8601(end_date)
+            }
           }
         }
       end
+
+    Enum.count(queries)
+    |> IO.inspect()
 
     Task.async_stream(queries, &crawl_index/1)
     |> Enum.reduce([], fn
@@ -248,7 +261,9 @@ defmodule Crawler do
     end)
   end
 
-  defp crawl_index(query) do
+  def crawl_index(query) do
+    IO.inspect(query)
+
     base_query = %{
       "aggs" => %{
         "fields" => [
@@ -277,6 +292,7 @@ defmodule Crawler do
       "guiLanguage" => "de",
       "metadataKeywordsMap" => query["metadata"],
       "queryString" => query["query"],
+      "metadataDateMap" => query["metadataDateMap"],
       "sessionDuration" => 10,
       "userID" => Client.gen_uid()
     }
@@ -290,6 +306,8 @@ defmodule Crawler do
       |> Map.get("documents")
       |> Enum.map(&Parser.transform_overview_result/1)
 
+    IO.inspect({query["metadataDateMap"], "start"})
+    
     other_pages =
       for i <- 10..total//10 do
         query = Map.put(base_query, "from", i)
@@ -299,10 +317,13 @@ defmodule Crawler do
         |> Enum.map(&Parser.transform_overview_result/1)
       end
 
+    IO.inspect({query["metadataDateMap"], Enum.count(other_pages)})
+    
     [first_page, other_pages]
   end
 
   defp crawl_single_page(%{"leid" => leid} = doc) do
+    IO.inspect(leid)
     date = DateTime.now!("Europe/Zurich", Tz.TimeZoneDatabase)
     single = Client.request_single(leid)
 
@@ -376,20 +397,15 @@ Kino.listen(form, fn event ->
     DateTime.now!("Europe/Zurich", Tz.TimeZoneDatabase)
     |> DateTime.to_date()
 
+  :ok = File.write!("./Documents/weblaw/" <> "weblaw-download-#{date}.csv", 
+    Explorer.DataFrame.dump_csv!(df)
+  )
+
   Kino.Frame.clear(frame)
 
   Kino.Frame.render(
     frame,
-    Kino.Layout.tabs(
-      raw_data: df,
-      download:
-        Kino.Download.new(
-          fn ->
-            Explorer.DataFrame.dump_csv!(df)
-          end,
-          filename: "weblaw-download-#{date}.csv"
-        )
-    )
+    df
   )
 end)
 
@@ -399,4 +415,72 @@ Kino.Layout.grid([
 ])
 ```
 
-<!-- livebook:{"offset":10737,"stamp":{"token":"XCP.QCKWnm1cYh_CmmW5wVDTDd2g44KMojqXvCh1QLbV4KjnwkK_D41d_6VsFychDQ9xoHWmtX7sjeAjtrdWX1hNCWdcUR9M0cvhCSUtdTuUv7rW7GNFXLyCWAoN","version":2}} -->
+```elixir
+{time, results} = :timer.tc(Crawler, :run, [""])
+
+  IO.inspect("time to fetch results #{time / 1_000_000}s")
+```
+
+```elixir
+data =
+    results
+    |> Stream.map(fn %{listing: doc, single: single, request_date: date} ->
+      [
+        InterneDocId: doc["leid"],
+        Title: Parser.get_title(single),
+        SortTitle: hd(single["metadataKeywordTextMap"]["sortTitle"]),
+        Abteilung: doc["Abteilung"],
+        Prozessgegenstand: doc["Prozessgegenstand"],
+        Regeste: doc["Regeste"],
+        Sachgebiet: doc["Sachgebiet"],
+        Eingangsjahr: hd(single["metadataKeywordTextMap"]["year"]),
+        Publikationsdatum: Parser.get_publication_data(single),
+        Entscheiddatum: Parser.get_ruling_data(single),
+        AbrufDatum: date,
+        Sprache: Parser.get_language(single),
+        Ruling_Type: Parser.get_ruling_type(single),
+        Text_Content: Parser.html_to_text(single),
+        HTML_Content: single["content"],
+        PDF_URL: Parser.get_pdf_url(single)
+      ] ++ Parser.extract_nested_metadta(single)
+    end)
+    |> Stream.uniq_by(fn list -> hd(list) end)
+    |> Enum.reverse()
+
+  df = Explorer.DataFrame.new(data)
+
+  date =
+    DateTime.now!("Europe/Zurich", Tz.TimeZoneDatabase)
+    |> DateTime.to_date()
+
+  :ok = File.write!("./Documents/weblaw/" <> "weblaw-download-#{date}.csv", 
+    Explorer.DataFrame.dump_csv!(df)
+  )
+```
+
+```elixir
+start_date = ~D[2025-12-21]
+end_date = ~D[2025-12-31]
+
+%{
+  # "query" => query,
+  "metadata" => %{
+    # "year" => to_string(year),
+    "language" => "de",
+    "panel" => "Abt. V (Asylrecht);;Cour V (droit d'asile);;Corte V (diritto di asilo);;Abt. V (Asylrecht)"
+  },
+  "metadataDateMap" => %{
+    "publicationDate" => %{
+      "from" => Date.to_iso8601(start_date),
+      "to" => Date.to_iso8601(end_date)
+    }
+  }
+}
+|> Crawler.crawl_index()
+```
+
+```elixir
+File.mkdir_p!("./Documents/weblaw/")
+```
+
+<!-- livebook:{"offset":13100,"stamp":{"token":"XCP.hgh0wYWeL4EMMD129nNkzm49vKXr4qtE_dLV72RzdOj87Tbw-6nEvfPbX9I8x7PwngzEW9GjPHaXVrVAvOSOkNCZwdZYbcjvP7Y1eK9oE2NgKwtblzviozRj","version":2}} -->
